@@ -1,1 +1,1 @@
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/yagopere/proxmox-scripts/refs/heads/main/ollama-openwebui-lxc.sh)" рабочая версия ламы!
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/yagopere/proxmox-scripts/refs/heads/main/LMStudio.sh)" рабочая версия ламы!
