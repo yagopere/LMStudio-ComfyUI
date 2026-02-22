@@ -1,7 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # Скрипт создания LXC с ComfyUI + Flux + LM Studio в Proxmox
-# Версия с проверкой и автоматической загрузкой шаблона
+# Версия без зависимости от хранилища 'local'
+# Шаблон скачивается и используется только в указанном хранилище
 # =============================================================================
 set -euo pipefail
 trap 'echo "Ошибка на строке $LINENO"; exit 1' ERR
@@ -15,40 +16,48 @@ SWAP=8192                         # MB
 DISK_SIZE=128                     # GB — Flux + модели + LM Studio легко занимают 80–120 ГБ
 CPU_CORES=8                       # ядер
 STORAGE="zpool-storage"           # твоё основное хранилище (проверь pvesm status)
-TEMPLATE_NAME="ubuntu-24.04-standard_24.04-1_amd64.tar.zst"  # актуальный на 2026
+TEMPLATE_NAME="ubuntu-24.04-standard_24.04-2_amd64.tar.zst"  # самая свежая на 2026
 TEMPLATE_FULL="${STORAGE}:vztmpl/${TEMPLATE_NAME}"
 # ================================================
 
-echo "=== Проверка хранилища ==="
+echo "=== Проверка хранилища '${STORAGE}' ==="
 if ! pvesm status | grep -q "^${STORAGE} "; then
-    echo "ОШИБКА: Хранилище '${STORAGE}' не найдено!"
+    echo "ОШИБКА: Хранилище '${STORAGE}' не найдено или не активно!"
     echo "Доступные хранилища:"
     pvesm status
     exit 1
 fi
 
+if pvesm status | grep "^${STORAGE} " | grep -q "disabled"; then
+    echo "ОШИБКА: Хранилище '${STORAGE}' отключено!"
+    exit 1
+fi
+
 FREE_SPACE_KB=$(pvesm status | grep "^${STORAGE} " | awk '{print $5}')
-MIN_SPACE_KB=$((DISK_SIZE * 1024 * 1024))
+MIN_SPACE_KB=$((DISK_SIZE * 1024 * 1024 + 1024 * 1024 * 5))  # +5 ГБ запас
 if [ "$FREE_SPACE_KB" -lt "$MIN_SPACE_KB" ]; then
     echo "ВНИМАНИЕ: На хранилище ${STORAGE} свободно только $((FREE_SPACE_KB/1024/1024)) ГБ!"
-    echo "Нужно минимум ${DISK_SIZE} ГБ"
+    echo "Нужно минимум ${DISK_SIZE} ГБ + запас"
     read -p "Продолжить всё равно? (y/N): " answer
     [[ "$answer" != "y" && "$answer" != "Y" ]] && exit 1
 fi
 
-echo "=== Проверка и скачивание шаблона ${TEMPLATE_NAME} ==="
+echo "=== Проверка и скачивание шаблона ${TEMPLATE_NAME} в хранилище ${STORAGE} ==="
 
-if [ ! -f "/var/lib/vz/template/cache/${TEMPLATE_NAME}" ] && [ ! -f "/${STORAGE}/template/cache/${TEMPLATE_NAME}" ]; then
-    echo "Шаблон ${TEMPLATE_NAME} не найден. Скачиваем..."
+# Проверяем наличие в кэше хранилища (путь может быть /${STORAGE}/template/cache/)
+TEMPLATE_CACHE_PATH="/${STORAGE}/template/cache/${TEMPLATE_NAME}"
+if [ ! -f "${TEMPLATE_CACHE_PATH}" ]; then
+    echo "Шаблон ${TEMPLATE_NAME} не найден в ${STORAGE}. Скачиваем..."
     pveam update
     pveam download "${STORAGE}" "${TEMPLATE_NAME}"
     if [ $? -ne 0 ]; then
-        echo "Ошибка скачивания шаблона. Проверь pveam available | grep ubuntu-24.04"
+        echo "Ошибка скачивания шаблона!"
+        echo "Проверь доступные шаблоны: pveam available | grep ubuntu-24.04"
         exit 1
     fi
     echo "Шаблон успешно скачан в ${STORAGE}"
 else
-    echo "Шаблон ${TEMPLATE_NAME} уже присутствует"
+    echo "Шаблон ${TEMPLATE_NAME} уже присутствует в ${STORAGE}"
 fi
 
 echo "=== Создание LXC контейнера ${CTID} (${CT_NAME}) на хранилище ${STORAGE} ==="
@@ -70,7 +79,7 @@ if [ "${GPU_PASSTHROUGH:-false}" = true ]; then
     echo "lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file" >> /etc/pve/lxc/${CTID}.conf
     echo "lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file" >> /etc/pve/lxc/${CTID}.conf
     echo "lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir" >> /etc/pve/lxc/${CTID}.conf
-    echo "GPU passthrough добавлен"
+    echo "GPU passthrough добавлен в конфиг"
 fi
 
 echo "=== Запуск контейнера и базовая настройка ==="
@@ -132,8 +141,9 @@ chmod +x ~/start_all.sh
 "
 
 echo "=== УСПЕХ! ==="
-echo "Контейнер ${CTID} создан на ${STORAGE}."
+echo "Контейнер ${CTID} создан на хранилище ${STORAGE}."
 echo "Войди: pct enter ${CTID}"
 echo "Затем от пользователя user: ~/start_all.sh"
 echo "ComfyUI → http://IP_контейнера:8188"
 echo "LM Studio → скачай AppImage и запусти внутри"
+echo "Готово! 🚀"
