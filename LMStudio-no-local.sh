@@ -1,8 +1,8 @@
 #!/bin/bash
 # =============================================================================
 # Скрипт создания LXC с ComfyUI + Flux + LM Studio в Proxmox
-# Полностью независим от хранилища 'local'
-# Автоматически скачивает самый свежий шаблон Ubuntu 24.04 в указанное хранилище
+# Полностью без зависимости от 'local'
+# Автоматически скачивает самый свежий шаблон Ubuntu 24.04
 # =============================================================================
 set -euo pipefail
 trap 'echo "Ошибка на строке $LINENO"; exit 1' ERR
@@ -21,34 +21,25 @@ STORAGE="zpool-storage"           # твоё основное хранилище
 echo "=== Проверка хранилища '${STORAGE}' ==="
 if ! pvesm status | grep -q "^${STORAGE} "; then
     echo "ОШИБКА: Хранилище '${STORAGE}' не найдено или не активно!"
-    echo "Доступные хранилища:"
     pvesm status
-    exit 1
-fi
-
-if pvesm status | grep "^${STORAGE} " | grep -q "disabled"; then
-    echo "ОШИБКА: Хранилище '${STORAGE}' отключено!"
     exit 1
 fi
 
 FREE_SPACE_KB=$(pvesm status | grep "^${STORAGE} " | awk '{print $5}')
 MIN_SPACE_KB=$((DISK_SIZE * 1024 * 1024 + 1024 * 1024 * 10))  # +10 ГБ запас
 if [ "$FREE_SPACE_KB" -lt "$MIN_SPACE_KB" ]; then
-    echo "ВНИМАНИЕ: На хранилище ${STORAGE} свободно только $((FREE_SPACE_KB/1024/1024)) ГБ!"
-    echo "Нужно минимум ${DISK_SIZE} ГБ + запас"
-    read -p "Продолжить всё равно? (y/N): " answer
+    echo "ВНИМАНИЕ: Свободно только $((FREE_SPACE_KB/1024/1024)) ГБ на ${STORAGE}"
+    read -p "Продолжить? (y/N): " answer
     [[ "$answer" != "y" && "$answer" != "Y" ]] && exit 1
 fi
 
-echo "=== Поиск и скачивание самого свежего шаблона Ubuntu 24.04 ==="
+echo "=== Поиск самого свежего шаблона Ubuntu 24.04 ==="
 pveam update
-
-# Ищем самый свежий шаблон Ubuntu 24.04
-LATEST_TEMPLATE=$(pveam available | grep -o 'ubuntu-24.04-standard_24.04-[0-9]*_amd64.tar.zst' | sort -V | tail -1)
+LATEST_TEMPLATE=$(pveam available | grep -oP 'ubuntu-24.04-standard_24.04-\d+_amd64\.tar\.zst' | sort -V | tail -1)
 
 if [ -z "$LATEST_TEMPLATE" ]; then
-    echo "ОШИБКА: Не удалось найти шаблон Ubuntu 24.04 в pveam available!"
-    echo "Проверь репозитории: pveam available | grep ubuntu"
+    echo "ОШИБКА: Не найден шаблон Ubuntu 24.04!"
+    pveam available | grep ubuntu-24.04
     exit 1
 fi
 
@@ -56,21 +47,18 @@ echo "Самый свежий шаблон: $LATEST_TEMPLATE"
 
 TEMPLATE_FULL="${STORAGE}:vztmpl/${LATEST_TEMPLATE}"
 
-# Проверяем наличие в кэше хранилища
-TEMPLATE_CACHE_PATH="/${STORAGE}/template/cache/${LATEST_TEMPLATE}"
-if [ ! -f "${TEMPLATE_CACHE_PATH}" ]; then
-    echo "Шаблон ${LATEST_TEMPLATE} не найден в ${STORAGE}. Скачиваем..."
+echo "=== Скачивание шаблона в ${STORAGE} (если отсутствует) ==="
+if ! pvesm list "${STORAGE}" | grep -q "${LATEST_TEMPLATE}"; then
     pveam download "${STORAGE}" "${LATEST_TEMPLATE}"
     if [ $? -ne 0 ]; then
-        echo "Ошибка скачивания шаблона!"
+        echo "Ошибка скачивания!"
         exit 1
     fi
-    echo "Шаблон успешно скачан в ${STORAGE}"
 else
-    echo "Шаблон ${LATEST_TEMPLATE} уже присутствует в ${STORAGE}"
+    echo "Шаблон уже есть"
 fi
 
-echo "=== Создание LXC контейнера ${CTID} (${CT_NAME}) на хранилище ${STORAGE} ==="
+echo "=== Создание LXC ${CTID} (${CT_NAME}) на ${STORAGE} ==="
 
 pct create ${CTID} "${TEMPLATE_FULL}" \
     --hostname "${HOSTNAME}" \
@@ -84,30 +72,33 @@ pct create ${CTID} "${TEMPLATE_FULL}" \
 
 echo "=== Настройка GPU passthrough (если включено) ==="
 if [ "${GPU_PASSTHROUGH:-false}" = true ]; then
-    echo "lxc.cgroup.devices.allow: a" >> /etc/pve/lxc/${CTID}.conf
+    echo "lxc.cgroup2.devices.allow: a" >> /etc/pve/lxc/${CTID}.conf
     echo "lxc.mount.entry: /dev/nvidia0 dev/nvidia0 none bind,optional,create=file" >> /etc/pve/lxc/${CTID}.conf
     echo "lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file" >> /etc/pve/lxc/${CTID}.conf
     echo "lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file" >> /etc/pve/lxc/${CTID}.conf
     echo "lxc.mount.entry: /dev/dri dev/dri none bind,optional,create=dir" >> /etc/pve/lxc/${CTID}.conf
-    echo "GPU passthrough добавлен"
 fi
 
-echo "=== Запуск контейнера и базовая настройка ==="
+echo "=== Запуск контейнера и настройка ==="
 pct start ${CTID}
 pct exec ${CTID} -- bash -c "
 set -e
 export DEBIAN_FRONTEND=noninteractive
-apt update && apt upgrade -y
-apt install -y locales git python3 python3-venv python3-pip wget aria2 curl tmux htop sudo
 
-# Фикс локалей сразу после установки
+# Фикс локалей сразу
+apt update
+apt install -y locales
 echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen
 locale-gen en_US.UTF-8
 update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
 
+apt upgrade -y
+apt install -y git python3 python3-venv python3-pip wget aria2 curl tmux htop sudo
+
 adduser --disabled-password --gecos '' user
 adduser user sudo
 echo 'user ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers.d/user
+
 su - user -c '
 set -e
 cd ~
@@ -157,9 +148,8 @@ chmod +x ~/start_all.sh
 "
 
 echo "=== УСПЕХ! ==="
-echo "Контейнер ${CTID} создан на хранилище ${STORAGE}."
+echo "Контейнер ${CTID} создан на ${STORAGE}."
 echo "Войди: pct enter ${CTID}"
 echo "Затем от пользователя user: ~/start_all.sh"
-echo "ComfyUI → http://IP_контейнера:8188"
-echo "LM Studio → скачай AppImage и запусти внутри"
+echo "ComfyUI: http://IP_контейнера:8188"
 echo "Готово! 🚀"
